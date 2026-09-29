@@ -203,16 +203,33 @@ function displayBroadcastKeys(values) {
 		? _('Key index %s').format(values.broadcast_key_indexes.join(', ')) : _('Not provisioned');
 }
 
+/* cgi-exec answers with HTTP 200 and the process stdout, so a failing
+ * command shows up as unparsable output here. Keep the captured text in
+ * the error message to make the underlying failure visible. */
+function commandError(label, output) {
+	var text = (output || '').trim().replace(/\s+/g, ' ');
+
+	if (!text)
+		return label;
+
+	if (text.length > 200)
+		text = text.substring(0, 200) + '…';
+
+	return '%s: %s'.format(label, text);
+}
+
 function loadProtocolStatus(section, unavailable, invalid) {
 	return L.resolveDefault(
-		fs.exec_direct('/usr/bin/pondctl', [ 'status', '--line', section.line ]), null
+		fs.exec_direct('/usr/bin/pondctl', [ 'status', '--line', section.line ],
+			'text', false, true), null
 	).then(function(output) {
 		if (output == null)
 			return { section: section, values: {}, error: unavailable };
 		try {
 			return { section: section, values: JSON.parse(output), error: null };
 		} catch (exception) {
-			return { section: section, values: {}, error: invalid };
+			return { section: section, values: {},
+				error: commandError(invalid, output) };
 		}
 	});
 }
@@ -231,17 +248,26 @@ function loadStatus() {
 		if (!device)
 			return Promise.resolve({ section: section, line: {}, error: _('No device configured') });
 		return L.resolveDefault(fs.exec_direct('/usr/sbin/ponctl',
-			[ '--device', device, 'status', '--json' ]), null).then(function(output) {
+			[ '--device', device, 'status', '--json' ], 'text', false, true),
+			null).then(function(output) {
 			var snapshot;
+
+			if (output == null)
+				return { section: section, line: {},
+					error: _('Device unavailable') };
+
 			try {
 				snapshot = JSON.parse(output);
-				if (snapshot.schema_version !== 1 || !snapshot.line)
-					throw new Error('status schema');
 			} catch (error) {
 				return { section: section, line: {},
-					error: output == null ? _('Device unavailable') :
-						_('Invalid status response') };
+					error: commandError(_('Invalid status response'), output) };
 			}
+
+			if (snapshot.schema_version !== 1 || !snapshot.line)
+				return { section: section, line: {},
+					error: _('Unexpected status schema (version %s)')
+						.format(snapshot.schema_version == null ? '-' : snapshot.schema_version) };
+
 			return {
 				section: section,
 				line: snapshot.line,
