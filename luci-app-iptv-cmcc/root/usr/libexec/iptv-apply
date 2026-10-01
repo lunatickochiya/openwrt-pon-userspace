@@ -1,0 +1,381 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+ACTION="${1:-reload}"
+NFT_FILE="/etc/iptv.nft"
+
+fail() {
+	logger -t iptv "$*"
+	echo "iptv: $*" >&2
+	exit 1
+}
+
+validate_ifname() {
+	local name="$1"
+
+	[ -n "$name" ] || return 1
+	[ "${#name}" -le 15 ] || return 1
+
+	case "$name" in
+		*[!A-Za-z0-9_.:-]*) return 1 ;;
+	esac
+
+	return 0
+}
+
+validate_vlan() {
+	local vid="$1"
+
+	case "$vid" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+
+	[ "$vid" -ge 1 ] && [ "$vid" -le 4094 ]
+}
+
+load_iptv_config() {
+	config_load iptv
+	config_get_bool ENABLED config enabled 0
+	# lan_port 由 LuCI 管理（主口，单个）；extra_lan_ports 为额外端口列表。
+	config_get LAN_PORT config lan_port
+	config_get EXTRA_LAN_PORTS config extra_lan_ports
+	config_get UPLINK config uplink pon0
+	config_get SERVICE_VLAN config service_vlan
+	config_get MULTICAST_VLAN config multicast_vlan
+	config_get IGMP_VLAN config igmp_vlan
+}
+
+build_lan_ports() {
+	local p
+
+	LAN_PORTS=""
+	for p in $LAN_PORT $EXTRA_LAN_PORTS; do
+		[ -n "$p" ] || continue
+		case " $LAN_PORTS " in
+			*" $p "*) continue ;;
+		esac
+		LAN_PORTS="$LAN_PORTS $p"
+	done
+	LAN_PORTS="${LAN_PORTS# }"
+
+	# nft 接口集合： iifname/oifname { "lan3", "lan4" }
+	LAN_SET=""
+	for p in $LAN_PORTS; do
+		if [ -n "$LAN_SET" ]; then
+			LAN_SET="$LAN_SET, \"$p\""
+		else
+			LAN_SET="\"$p\""
+		fi
+	done
+	LAN_SET="{ $LAN_SET }"
+}
+
+find_br_lan() {
+	local section="$1"
+	local name
+
+	config_get name "$section" name
+	[ "$name" = "br-lan" ] && BR_LAN_SECTION="$section"
+}
+
+find_old_iptv_port() {
+	local port
+	local ports
+
+	OLD_LAN_PORTS=""
+	config_get ports luci_iptv_bridge ports
+	for port in $ports; do
+		case "$port" in
+			ct-iptv-svc|ct-iptv-mc|ct-iptv-igmp) ;;
+			*) OLD_LAN_PORTS="$OLD_LAN_PORTS $port" ;;
+		esac
+	done
+	OLD_LAN_PORTS="${OLD_LAN_PORTS# }"
+}
+
+detach_from_device() {
+	local section="$1"
+	local ports port p
+
+	config_get ports "$section" ports
+	for port in $ports; do
+		for p in $LAN_PORTS; do
+			[ "$port" = "$p" ] && uci -q del_list "network.$section.ports=$port"
+		done
+	done
+}
+
+detach_from_interface() {
+	local section="$1"
+	local device ifnames ifname p
+
+	[ "$section" = "luci_iptv" ] && return
+
+	config_get device "$section" device
+	config_get ifnames "$section" ifname
+	for p in $LAN_PORTS; do
+		[ "$device" = "$p" ] && uci -q delete "network.$section.device"
+	done
+
+	for ifname in $ifnames; do
+		for p in $LAN_PORTS; do
+			[ "$ifname" = "$p" ] || continue
+			uci -q del_list "network.$section.ifname=$ifname" || uci -q delete "network.$section.ifname"
+		done
+	done
+}
+
+detach_from_bridge_vlan() {
+	local section="$1"
+	local ports token base p
+
+	config_get ports "$section" ports
+	for token in $ports; do
+		base="${token%%:*}"
+		for p in $LAN_PORTS; do
+			[ "$base" = "$p" ] && uci -q del_list "network.$section.ports=$token"
+		done
+	done
+}
+
+validate_config() {
+	local p
+
+	[ "$ENABLED" -eq 1 ] || return 0
+
+	for p in $LAN_PORTS; do
+		validate_ifname "$p" || fail "LAN 口名称无效"
+		[ "$p" != "$UPLINK" ] || fail "LAN 口不能同时作为上联设备"
+		[ -e "/sys/class/net/$p" ] || fail "找不到 LAN 口 $p"
+	done
+	validate_ifname "$UPLINK" || fail "上联设备名称无效"
+	validate_vlan "$SERVICE_VLAN" || fail "业务 VLAN 必须在 1 到 4094 之间"
+
+	if [ -n "$MULTICAST_VLAN" ]; then
+		validate_vlan "$MULTICAST_VLAN" || fail "组播 VLAN 必须在 1 到 4094 之间"
+		[ "$MULTICAST_VLAN" != "$SERVICE_VLAN" ] || fail "组播与业务共用 VLAN 时请将组播 VLAN 留空"
+	fi
+	[ -z "$IGMP_VLAN" ] || validate_vlan "$IGMP_VLAN" || fail "IGMP 上行 VLAN 必须在 1 到 4094 之间"
+
+	[ -e "/sys/class/net/$UPLINK" ] || fail "找不到上联设备 $UPLINK"
+}
+
+resolve_igmp_port() {
+	# 未单独指定时沿用组播下行 VLAN；没有独立组播 VLAN 时走业务 VLAN。
+	IGMP_PORT='ct-iptv-svc'
+	[ -n "$MULTICAST_VLAN" ] && IGMP_PORT='ct-iptv-mc'
+
+	[ -n "$IGMP_VLAN" ] || return
+	if [ "$IGMP_VLAN" = "$SERVICE_VLAN" ]; then
+		IGMP_PORT='ct-iptv-svc'
+	elif [ -n "$MULTICAST_VLAN" ] && [ "$IGMP_VLAN" = "$MULTICAST_VLAN" ]; then
+		IGMP_PORT='ct-iptv-mc'
+	else
+		IGMP_PORT='ct-iptv-igmp'
+	fi
+}
+
+write_nft_rules() {
+	local tmp
+
+	tmp="$(mktemp /etc/iptv.nft.XXXXXX)" || fail "无法创建 nftables 临时文件"
+
+	if [ "$ENABLED" -ne 1 ]; then
+		cat >"$tmp" <<'EOF'
+# IPTV 未启用，本文件由 luci-app-iptv 管理。
+EOF
+	else
+		cat >"$tmp" <<EOF
+# 先声明并清空已有表，使 firewall4 reload 可以重复执行而不累积规则。
+table bridge iptv
+flush table bridge iptv
+
+table bridge iptv {
+	chain iptv_forward {
+		# 业务 VLAN 承载机顶盒的 DHCP、鉴权、点播等双向流量。
+		iifname $LAN_SET oifname "ct-iptv-svc" counter accept
+		iifname "ct-iptv-svc" oifname $LAN_SET counter accept
+EOF
+		if [ -n "$MULTICAST_VLAN" ]; then
+			cat >>"$tmp" <<EOF
+		# 独立组播 VLAN 只向机顶盒发送 IPv4 组播流。
+		iifname "ct-iptv-mc" oifname $LAN_SET \
+			ether type ip ip daddr 224.0.0.0/4 counter accept
+		iifname "ct-iptv-svc" oifname "ct-iptv-mc" \
+			counter drop comment "block-service-to-multicast"
+		iifname "ct-iptv-mc" oifname "ct-iptv-svc" \
+			counter drop comment "block-multicast-to-service"
+EOF
+		fi
+		if [ "$IGMP_PORT" != 'ct-iptv-svc' ]; then
+			cat >>"$tmp" <<EOF
+		# Join/Leave 使用普通双向 GEM；此端口只负责按 OLT 要求补上上行 VLAN。
+		iifname $LAN_SET oifname "$IGMP_PORT" \
+			ether type ip ip protocol igmp counter accept comment "allow-stb-igmp"
+		iifname $LAN_SET oifname "$IGMP_PORT" \
+			counter drop comment "block-stb-data-to-igmp-vlan"
+EOF
+		fi
+
+		cat >>"$tmp" <<'EOF'
+		counter drop comment "drop-other-iptv-bridge-traffic"
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+
+		# bridge family 的基链会看到所有网桥，只把 br-iptv 送入隔离链。
+		meta ibrname "br-iptv" jump iptv_forward
+	}
+}
+EOF
+	fi
+
+	if ! nft -c -f "$tmp" >/dev/null 2>&1; then
+		rm -f "$tmp"
+		fail "生成的 nftables 规则未通过语法检查"
+	fi
+
+	chmod 0644 "$tmp"
+	mv -f "$tmp" "$NFT_FILE"
+}
+
+restore_old_lan_port() {
+	local p
+
+	[ -n "$OLD_LAN_PORTS" ] || return
+	[ -n "$BR_LAN_SECTION" ] || return
+
+	# IPTV 停用或换口后，把旧端口放回默认 LAN 网桥。
+	for p in $OLD_LAN_PORTS; do
+		uci -q del_list "network.$BR_LAN_SECTION.ports=$p"
+		uci -q add_list "network.$BR_LAN_SECTION.ports=$p"
+	done
+}
+
+remove_selected_port_from_br_lan() {
+	local p
+
+	[ -n "$BR_LAN_SECTION" ] || return
+	for p in $LAN_PORTS; do
+		uci -q del_list "network.$BR_LAN_SECTION.ports=$p"
+	done
+}
+
+remove_managed_network() {
+	uci -q delete network.luci_iptv
+	uci -q delete network.luci_iptv_bridge
+	uci -q delete network.luci_iptv_service_vlan
+	uci -q delete network.luci_iptv_multicast_vlan
+	uci -q delete network.luci_iptv_igmp_vlan
+}
+
+write_network_config() {
+	local p
+
+	restore_old_lan_port
+	remove_managed_network
+
+	if [ "$ENABLED" -eq 1 ]; then
+		# 所选端口完全交给 IPTV 使用。这里直接解除原有引用，避免同一
+		# 物理端口同时被两个 netifd 设备管理。
+		config_foreach detach_from_device device
+		config_foreach detach_from_interface interface
+		config_foreach detach_from_bridge_vlan bridge-vlan
+		remove_selected_port_from_br_lan
+
+		uci set network.luci_iptv_service_vlan='device'
+		uci set network.luci_iptv_service_vlan.type='8021q'
+		uci set network.luci_iptv_service_vlan.ifname="$UPLINK"
+		uci set network.luci_iptv_service_vlan.vid="$SERVICE_VLAN"
+		uci set network.luci_iptv_service_vlan.name='ct-iptv-svc'
+
+		if [ -n "$MULTICAST_VLAN" ]; then
+			uci set network.luci_iptv_multicast_vlan='device'
+			uci set network.luci_iptv_multicast_vlan.type='8021q'
+			uci set network.luci_iptv_multicast_vlan.ifname="$UPLINK"
+			uci set network.luci_iptv_multicast_vlan.vid="$MULTICAST_VLAN"
+			uci set network.luci_iptv_multicast_vlan.name='ct-iptv-mc'
+			# 组播口关闭 MAC 学习：运营商在组播 VLAN 上复用网关 MAC 发 IGMP，
+			# 若学习开启，机顶盒单播会被误转发到组播口并被隔离规则丢弃。
+			uci set network.luci_iptv_multicast_vlan.learning='0'
+		fi
+
+		if [ "$IGMP_PORT" = 'ct-iptv-igmp' ]; then
+			uci set network.luci_iptv_igmp_vlan='device'
+			uci set network.luci_iptv_igmp_vlan.type='8021q'
+			uci set network.luci_iptv_igmp_vlan.ifname="$UPLINK"
+			uci set network.luci_iptv_igmp_vlan.vid="$IGMP_VLAN"
+			uci set network.luci_iptv_igmp_vlan.name='ct-iptv-igmp'
+		fi
+
+		uci set network.luci_iptv_bridge='device'
+		uci set network.luci_iptv_bridge.type='bridge'
+		uci set network.luci_iptv_bridge.name='br-iptv'
+		uci set network.luci_iptv_bridge.stp='0'
+		# 过滤规则已经把组播侧上行限制为 IGMP；关闭 snooping 后，组播
+		# 下行无需依赖网桥先学习到 MDB 条目。
+		uci set network.luci_iptv_bridge.igmp_snooping='0'
+		for p in $LAN_PORTS; do
+			uci add_list network.luci_iptv_bridge.ports="$p"
+		done
+		uci add_list network.luci_iptv_bridge.ports='ct-iptv-svc'
+		[ -n "$MULTICAST_VLAN" ] && uci add_list network.luci_iptv_bridge.ports='ct-iptv-mc'
+		[ "$IGMP_PORT" = 'ct-iptv-igmp' ] && uci add_list network.luci_iptv_bridge.ports='ct-iptv-igmp'
+
+		uci set network.luci_iptv='interface'
+		uci set network.luci_iptv.proto='none'
+		uci set network.luci_iptv.device='br-iptv'
+		uci set network.luci_iptv.auto='1'
+		uci set network.luci_iptv.delegate='0'
+	fi
+
+	uci commit network || fail "无法保存网络配置"
+}
+
+write_firewall_config() {
+	uci set firewall.luci_iptv='include'
+	uci set firewall.luci_iptv.type='nftables'
+	uci set firewall.luci_iptv.position='ruleset-append'
+	uci set firewall.luci_iptv.path="$NFT_FILE"
+	uci set firewall.luci_iptv.enabled="$ENABLED"
+	uci commit firewall || fail "无法保存 firewall4 配置"
+}
+
+reload_runtime() {
+	[ "$ACTION" = "boot" ] && return 0
+
+	if [ "$ENABLED" -eq 1 ]; then
+		# 先加载过滤规则，再创建网桥，避免新网桥短暂处于无过滤状态。
+		/etc/init.d/firewall reload || fail "firewall4 重新加载失败"
+		ubus call network reload >/dev/null || fail "netifd 重新加载失败"
+		# netifd 可能漏挂端口；后台等待网桥就绪后补挂并关闭组播口学习。
+		/usr/libexec/iptv-ensure >/dev/null 2>&1 &
+	else
+		# 先撤销网桥，再删除规则表，停用过程中不会出现未过滤转发。
+		ubus call network reload >/dev/null || fail "netifd 重新加载失败"
+		if nft list table bridge iptv >/dev/null 2>&1; then
+			nft delete table bridge iptv || fail "无法删除 IPTV 过滤表"
+		fi
+		/etc/init.d/firewall reload || fail "firewall4 重新加载失败"
+	fi
+}
+
+load_iptv_config
+build_lan_ports
+config_load network
+BR_LAN_SECTION=""
+OLD_LAN_PORTS=""
+config_foreach find_br_lan device
+find_old_iptv_port
+
+validate_config
+resolve_igmp_port
+write_nft_rules
+write_network_config
+write_firewall_config
+reload_runtime
+
+logger -t iptv "IPTV bridge configuration applied: LAN ports [$LAN_PORTS]"
+exit 0

@@ -1,0 +1,22 @@
+#!/bin/sh /etc/rc.common
+
+START=19
+USE_PROCD=1
+
+start_service() {
+	# 启动阶段只生成持久配置。network 和 firewall 随后会读取这些配置，
+	# 此处主动 reload 反而会与系统启动顺序产生竞争。
+	/usr/libexec/iptv-apply boot
+
+	# netifd 冷启动时两个 VLAN 设备共用 pon0 父口，网桥可能只挂上一个端口；
+	# 另外组播口必须关闭 MAC 学习。后台等待网桥就绪后自动修复。
+	/usr/libexec/iptv-ensure >/dev/null 2>&1 &
+}
+
+reload_service() {
+	/usr/libexec/iptv-apply reload
+}
+
+service_triggers() {
+	procd_add_reload_trigger "iptv"
+}
