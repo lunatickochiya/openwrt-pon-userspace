@@ -1,0 +1,49 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# Ensure the IPTV bridge is fully attached and MAC learning stays disabled on
+# the multicast port.
+#
+#  1) netifd's cold start / reload can attach only one VLAN child of the bridge
+#     (all VLAN devices share the pon0 parent), so re-attach every port listed
+#     in network.luci_iptv_bridge.ports.
+#  2) The BNG reuses the IPTV gateway MAC on the multicast VLAN (for IGMP). With
+#     learning enabled the bridge would forward the set-top box's unicast to the
+#     multicast port, where the isolation rule drops it: DHCP/ARP still work, so
+#     the box gets an IP but cannot reach any unicast server -> auth fails.
+
+ensure() {
+	local ports p
+
+	[ -e /sys/class/net/br-iptv ] || return 1
+	ports="$(uci -q get network.luci_iptv_bridge.ports)"
+	[ -n "$ports" ] || ports="ct-iptv-svc ct-iptv-mc"
+
+	for p in $ports; do
+		[ -e "/sys/class/net/$p" ] || continue
+		[ -e "/sys/class/net/br-iptv/brif/$p" ] || ip link set "$p" master br-iptv 2>/dev/null
+		[ -e "/sys/class/net/br-iptv/brif/$p" ] || return 1
+	done
+
+	if [ -e /sys/class/net/br-iptv/brif/ct-iptv-mc ]; then
+		bridge link set dev ct-iptv-mc learning off 2>/dev/null
+		bridge fdb show br br-iptv 2>/dev/null | grep ' dev ct-iptv-mc ' \
+			| grep -v 'permanent' | grep -v 'self' | awk '{print $1}' \
+			| while read -r mac; do bridge fdb del "$mac" dev ct-iptv-mc 2>/dev/null; done
+	fi
+	return 0
+}
+
+i=0
+while [ "$i" -lt 60 ]; do
+	if ensure; then
+		sleep 2
+		ensure
+		logger -t iptv-ensure "br-iptv ok: ports present, mc learning off"
+		exit 0
+	fi
+	i=$((i + 1))
+	sleep 1
+done
+logger -t iptv-ensure "br-iptv fix: timed out"
+exit 0

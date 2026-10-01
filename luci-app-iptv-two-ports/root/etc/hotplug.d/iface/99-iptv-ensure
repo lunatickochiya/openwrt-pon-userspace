@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[ "$ACTION" = "ifup" ] || exit 0
+[ "$INTERFACE" = "luci_iptv" ] || exit 0
+/usr/libexec/iptv-ensure >/dev/null 2>&1 &

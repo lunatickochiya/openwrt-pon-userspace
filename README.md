@@ -7,5 +7,6 @@
 | `airoha-pon-debug` | 0.1.0 | Capture and diagnostics / 抓包与诊断 |
 | `luci-app-pon` | 0.1.0 | PON interface and board identity editor / PON 界面与板级身份编辑 |
 | `luci-app-iptv` | 0.1.0 | IPTV bridge configuration / IPTV 桥接配置 |
+| `luci-app-iptv-two-ports` | 0.1.0 | IPTV bridge with two selectable LAN ports / 双网口 IPTV 桥接配置 |
 
 Board identity layout: [IDENTITY.md](IDENTITY.md).

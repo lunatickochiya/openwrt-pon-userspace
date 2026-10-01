@@ -1,0 +1,25 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: Apache-2.0
+
+START=19
+USE_PROCD=1
+
+start_service() {
+	# At boot only the persistent configuration is generated. network and
+	# firewall consume it later in the boot sequence, so reloading here would
+	# race with them.
+	/usr/libexec/iptv-apply boot
+
+	# netifd's cold start can attach only one of the VLAN devices that share
+	# the pon0 parent, and the multicast port must not learn MAC addresses.
+	# Wait for the bridge in the background and repair it.
+	/usr/libexec/iptv-ensure >/dev/null 2>&1 &
+}
+
+reload_service() {
+	/usr/libexec/iptv-apply reload
+}
+
+service_triggers() {
+	procd_add_reload_trigger "iptv"
+}
